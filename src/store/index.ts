@@ -6,17 +6,19 @@ import type {
 } from '../types';
 import { parseZip, buildFileTreeFromFiles, readFileAsText, readFileAsBuffer, createZip } from '../utils/zip';
 import { supportsFileSystemAccess, pickDirectory, readDirectoryRecursively, downloadBlob } from '../utils/fileAccess';
-import { inlineResources } from '../utils/dom';
+import { describeElement, inlineResources } from '../utils/dom';
+import { DeckDocument, sourceSelector } from '../utils/deckDocument';
 import { SLIDE_SELECTORS, FORMAT_PAINTER_PROPERTIES } from '../utils/constants';
 
 interface AppStore extends AppState {
+  deck: DeckDocument | null;
   importFiles: (files: FileList) => Promise<void>;
   importDirectory: () => Promise<void>;
   selectPage: (index: number) => void;
   setEditMode: (mode: boolean) => void;
   selectElement: (info: SelectedElementInfo | null) => void;
   applyStyle: (property: string, value: string) => void;
-  applyText: (text: string) => void;
+  commitText: (selector: string, html: string) => void;
   replaceImage: (imageData: string) => void;
   applyHtml: (html: string) => void;
   undo: () => void;
@@ -34,9 +36,6 @@ interface AppStore extends AppState {
   setShowSettings: (show: boolean) => void;
   setImportState: (state: Partial<ImportState>) => void;
   resetState: () => void;
-  setFileTree: (tree: FileNode[]) => void;
-  setPages: (pages: PageInfo[]) => void;
-  setIframeWindow: (win: Window | null) => void;
   copyFormatPainter: () => void;
   toggleFormatPainter: () => void;
   setFormatPainterSticky: (sticky: boolean) => void;
@@ -46,7 +45,6 @@ interface AppStore extends AppState {
 
 const initialState: AppState = {
   fileTree: [],
-  originalFileTree: [],
   currentFile: null,
   pages: [],
   currentPageIndex: -1,
@@ -71,7 +69,6 @@ const initialState: AppState = {
   rightPanelCollapsed: false,
   showSettings: false,
   hasImported: false,
-  iframeWindow: null,
 
   // 格式刷
   formatPainterSource: null,
@@ -79,503 +76,399 @@ const initialState: AppState = {
   formatPainterSticky: false,
 };
 
-export const useStore = create<AppStore>((set, get) => ({
-  ...initialState,
+export const useStore = create<AppStore>((set, get) => {
+  let importVersion = 0;
 
-  importFiles: async (files) => {
-    const { addToast, setFileTree, setPages } = get();
-    set({ importState: { ...initialState.importState, isImporting: true, progress: 0 } });
+  function openDeck(fileTree: FileNode[]) {
+    const main = fileTree.find(n => n.isMainHtml) || fileTree.find(n => /\.html?$/i.test(n.name));
+    if (!main) throw new Error('找不到 HTML 文件');
+    const deck = new DeckDocument(main);
+    set({
+      deck, fileTree, currentFile: main.path, hasImported: true,
+      pages: parsePageStructure(deck.source, main.path), currentPageIndex: 0,
+      selectedElement: null, undoStack: [], redoStack: [], formatPainterSource: null,
+      formatPainterActive: false, formatPainterSticky: false, importState: initialState.importState,
+    });
+  }
 
-    try {
-      let fileTree: FileNode[] = [];
-      const fileArray = Array.from(files);
-      const zipFile = fileArray.find((f) => f.name.endsWith('.zip'));
-      const htmlFiles = fileArray.filter((f) => f.name.endsWith('.html') || f.name.endsWith('.htm'));
-
-      if (zipFile) {
-        fileTree = await parseZip(zipFile);
-        addToast('ZIP 文件解析成功', 'success');
-      } else if (htmlFiles.length > 0) {
-        fileTree = buildFileTreeFromFiles(files);
-        for (const node of fileTree) {
-          if (node.type !== 'file') continue;
-          const file = fileArray.find((f) => f.name === node.name);
-          if (!file) continue;
-          if (node.name.endsWith('.html') || node.name.endsWith('.htm')) {
-            node.content = await readFileAsText(file);
-          } else {
-            node.content = await readFileAsBuffer(file);
-          }
-        }
-        addToast('HTML 文件导入成功', 'success');
-      } else {
-        addToast('请上传 HTML 文件或 ZIP 文件', 'warning');
-        set({ importState: { ...initialState.importState, isImporting: false } });
-        return;
-      }
-
-      set({ fileTree: [...fileTree], originalFileTree: JSON.parse(JSON.stringify(fileTree)) });
-      setFileTree(fileTree);
-
-      // 解析页面结构
-      const mainHtml = fileTree.find((n) => n.isMainHtml || n.name.endsWith('.html'));
-      if (mainHtml && typeof mainHtml.content === 'string') {
-        const pages = parsePageStructure(mainHtml.content, mainHtml.path);
-        setPages(pages);
-      }
-
-      set({ hasImported: true, currentFile: mainHtml?.path || null, currentPageIndex: 0, importState: { ...initialState.importState, isImporting: false } });
-    } catch (err) {
-      console.error('Import failed:', err);
-      addToast('导入失败: ' + (err instanceof Error ? err.message : '未知错误'), 'error');
-      set({ importState: { ...initialState.importState, isImporting: false } });
+  function applyAction(action: EditAction, direction: 'before' | 'after', alreadyTyped = false) {
+    const { deck, selectedElement, addToast } = get();
+    if (!deck?.apply(action, direction, alreadyTyped)) {
+      addToast('无法唯一定位原元素，修改未应用', 'warning');
+      return false;
     }
-  },
+    if (action.changes.some(c => c.type === 'content' || c.type === 'element')) {
+      const pages = parsePageStructure(deck.source, get().currentFile!);
+      set({ pages, currentPageIndex: Math.min(get().currentPageIndex, pages.length - 1) });
+    }
+    if (selectedElement) {
+      const el = deck.previewElement(selectedElement.selector);
+      set({ selectedElement: el ? describeElement(el, selectedElement.selector) : null });
+    }
+    return true;
+  }
 
-  importDirectory: async () => {
-    const { addToast, setFileTree, setPages } = get();
-    try {
-      if (!supportsFileSystemAccess()) {
-        addToast('您的浏览器不支持文件夹选择，请使用 Chrome 或 Edge', 'warning');
-        return;
-      }
-      const dirHandle = await pickDirectory();
+  function commit(target: string, changes: EditAction['changes'], alreadyTyped = false) {
+    const action = { target, changes: changes.filter(c => c.before !== c.after) };
+    if (!action.changes.length || !applyAction(action, 'after', alreadyTyped)) return false;
+    set(state => ({ undoStack: [...state.undoStack, action], redoStack: [] }));
+    return true;
+  }
+
+  function travel(direction: 'before' | 'after') {
+    get().deck?.finishTyping();
+    const from = direction === 'before' ? 'undoStack' : 'redoStack';
+    const to = direction === 'before' ? 'redoStack' : 'undoStack';
+    const state = get();
+    const action = state[from].at(-1);
+    if (action && applyAction(action, direction)) {
+      set({ [from]: state[from].slice(0, -1), [to]: [...state[to], action] });
+    }
+  }
+
+  function exportTree() {
+    get().deck?.finishTyping();
+    const { fileTree, deck, currentFile, undoStack } = get();
+    if (!deck || !undoStack.length) return fileTree;
+    return fileTree.map(node => node.path === currentFile ? { ...node, content: deck.serialize() } : node);
+  }
+
+  return {
+    ...initialState,
+    deck: null,
+
+    importFiles: async (files) => {
+      const version = ++importVersion;
+      const { addToast } = get();
       set({ importState: { ...initialState.importState, isImporting: true, progress: 0 } });
-      const fileTree = await readDirectoryRecursively(dirHandle);
-      set({ fileTree: [...fileTree], originalFileTree: JSON.parse(JSON.stringify(fileTree)) });
-      setFileTree(fileTree);
 
-      const mainHtml = fileTree.find((n) => n.isMainHtml || n.name.endsWith('.html'));
-      if (mainHtml && mainHtml.content) {
-        const content = typeof mainHtml.content === 'string'
-          ? mainHtml.content
-          : new TextDecoder().decode(mainHtml.content);
-        const pages = parsePageStructure(content, mainHtml.path);
-        setPages(pages);
+      try {
+        let fileTree: FileNode[] = [];
+        const fileArray = Array.from(files);
+        const zipFile = fileArray.find(f => /\.zip$/i.test(f.name));
+        const htmlFiles = fileArray.filter(f => /\.html?$/i.test(f.name));
+
+        if (zipFile) {
+          fileTree = await parseZip(zipFile);
+        } else if (htmlFiles.length > 0) {
+          fileTree = buildFileTreeFromFiles(files);
+          for (const node of fileTree) {
+            if (node.type !== 'file') continue;
+            const file = fileArray.find((f) => f.name === node.name);
+            if (!file) continue;
+            if (/\.html?$/i.test(node.name)) {
+              node.content = await readFileAsText(file);
+            } else {
+              node.content = await readFileAsBuffer(file);
+            }
+          }
+        } else {
+          addToast('请上传 HTML 文件或 ZIP 文件', 'warning');
+          set({ importState: { ...initialState.importState, isImporting: false } });
+          return;
+        }
+
+        if (version !== importVersion) return;
+        openDeck(fileTree);
+        addToast(zipFile ? 'ZIP 文件解析成功' : 'HTML 文件导入成功', 'success');
+      } catch (err) {
+        if (version !== importVersion) return;
+        console.error('Import failed:', err);
+        addToast('导入失败: ' + (err instanceof Error ? err.message : '未知错误'), 'error');
+        set({ importState: { ...initialState.importState, isImporting: false } });
       }
+    },
 
-      set({ hasImported: true, currentFile: mainHtml?.path || null, currentPageIndex: 0, importState: { ...initialState.importState, isImporting: false } });
-      addToast('文件夹导入成功', 'success');
-    } catch (err) {
-      console.error('Directory import failed:', err);
-      addToast('文件夹导入失败', 'error');
-      set({ importState: { ...initialState.importState, isImporting: false } });
-    }
-  },
+    importDirectory: async () => {
+      const version = ++importVersion;
+      const { addToast } = get();
+      try {
+        if (!supportsFileSystemAccess()) {
+          addToast('您的浏览器不支持文件夹选择，请使用 Chrome 或 Edge', 'warning');
+          return;
+        }
+        const dirHandle = await pickDirectory();
+        if (version !== importVersion) return;
+        set({ importState: { ...initialState.importState, isImporting: true, progress: 0 } });
+        const fileTree = await readDirectoryRecursively(dirHandle);
+        if (version !== importVersion) return;
+        openDeck(fileTree);
+        addToast('文件夹导入成功', 'success');
+      } catch (err) {
+        if (version !== importVersion) return;
+        console.error('Directory import failed:', err);
+        addToast('文件夹导入失败', 'error');
+        set({ importState: { ...initialState.importState, isImporting: false } });
+      }
+    },
 
-  selectPage: (index) => {
-    set({ currentPageIndex: index, selectedElement: null });
-  },
+    selectPage: (index) => {
+      get().deck?.finishTyping();
+      set({ currentPageIndex: index, selectedElement: null });
+    },
 
-  setEditMode: (mode) => {
-    set({ isEditMode: mode });
-  },
+    setEditMode: (mode) => {
+      get().deck?.finishTyping();
+      set({ isEditMode: mode, selectedElement: null });
+    },
 
-  selectElement: (info) => {
-    set({ selectedElement: info });
-  },
+    selectElement: (info) => {
+      set({ selectedElement: info });
+    },
 
-  applyStyle: (property, value) => {
-    const { selectedElement, undoStack } = get();
-    if (!selectedElement) return;
-    const action: EditAction = {
-      id: crypto.randomUUID(),
-      type: 'style',
-      target: selectedElement.selector,
-      property,
-      oldValue: selectedElement.computedStyles[property] || null,
-      newValue: value,
-      timestamp: Date.now(),
-    };
-    set({ undoStack: [...undoStack, action], redoStack: [] });
-    // 更新本地样式状态
-    set((state) => ({
-      selectedElement: state.selectedElement ? {
-        ...state.selectedElement,
-        computedStyles: { ...state.selectedElement.computedStyles, [property]: value }
-      } : null
-    }));
-    // 同步到 iframe
-    const { iframeWindow, selectedElement: sel } = get();
-    if (iframeWindow && sel) {
-      iframeWindow.postMessage({ type: 'DECKFORGE_APPLY_STYLE', selector: sel.selector, property, value }, '*');
-    }
-  },
+    applyStyle: (property, value) => {
+      const { deck, selectedElement } = get();
+      if (deck && selectedElement) {
+        commit(selectedElement.selector, deck.styleChanges(selectedElement.selector, { [property]: value }));
+      }
+    },
 
-  applyText: (text) => {
-    const { selectedElement, undoStack } = get();
-    if (!selectedElement || !selectedElement.isTextEditable) return;
-    const action: EditAction = {
-      id: crypto.randomUUID(),
-      type: 'text',
-      target: selectedElement.selector,
-      oldValue: selectedElement.textContent || null,
-      newValue: text,
-      timestamp: Date.now(),
-    };
-    set({ undoStack: [...undoStack, action], redoStack: [] });
-    // 同步到 iframe
-    const { iframeWindow, selectedElement: selText } = get();
-    if (iframeWindow && selText) {
-      iframeWindow.postMessage({ type: 'DECKFORGE_APPLY_TEXT', selector: selText.selector, text }, '*');
-    }
-  },
+    commitText: (target, html) => {
+      const el = get().deck?.source.querySelector(target);
+      if (el) commit(target, [{ type: 'content', before: el.innerHTML, after: html }], true);
+    },
 
-  replaceImage: (imageData) => {
-    const { selectedElement, undoStack } = get();
-    if (!selectedElement || !selectedElement.isImage) return;
-    const action: EditAction = {
-      id: crypto.randomUUID(),
-      type: 'replace',
-      target: selectedElement.selector,
-      oldValue: null,
-      newValue: imageData,
-      timestamp: Date.now(),
-    };
-    set({ undoStack: [...undoStack, action], redoStack: [] });
-    // 同步到 iframe
-    const { iframeWindow, selectedElement: selImg } = get();
-    if (iframeWindow && selImg) {
-      iframeWindow.postMessage({ type: 'DECKFORGE_REPLACE_IMAGE', selector: selImg.selector, imageData }, '*');
-    }
-  },
+    replaceImage: (imageData) => {
+      const { deck, selectedElement } = get();
+      if (!selectedElement || !deck) return;
+      const target = selectedElement.selector;
+      const img = deck.source.querySelector(target);
+      if (img?.localName !== 'img') return;
+      commit(target, [
+        { type: 'attribute', name: 'src', before: img.getAttribute('src'), after: imageData },
+        { type: 'attribute', name: 'srcset', before: img.getAttribute('srcset'), after: null },
+      ]);
+    },
 
-  applyHtml: (html) => {
-    const { selectedElement, undoStack } = get();
-    if (!selectedElement) return;
-    const action: EditAction = {
-      id: crypto.randomUUID(),
-      type: 'replace',
-      target: selectedElement.selector,
-      oldValue: selectedElement.textContent || null,
-      newValue: html,
-      timestamp: Date.now(),
-    };
-    set({ undoStack: [...undoStack, action], redoStack: [] });
-    // 同步到 iframe
-    const { iframeWindow, selectedElement: sel } = get();
-    if (iframeWindow && sel) {
-      iframeWindow.postMessage({ type: 'DECKFORGE_REPLACE_HTML', selector: sel.selector, html }, '*');
-    }
-    // 替换后清除选择，因为 DOM 结构可能已改变
-    set({ selectedElement: null });
-  },
+    applyHtml: (html) => {
+      const { deck, selectedElement } = get();
+      if (!selectedElement || !deck) return;
+      const target = selectedElement.selector;
+      const el = deck.source.querySelector(target);
+      if (el && commit(target, [{ type: 'element', before: el.outerHTML, after: html }])) {
+        set({ selectedElement: null });
+      }
+    },
 
-  undo: () => {
-    const { undoStack, redoStack } = get();
-    if (undoStack.length === 0) return;
-    const action = undoStack[undoStack.length - 1];
-    set({
-      undoStack: undoStack.slice(0, -1),
-      redoStack: [...redoStack, action],
-    });
-    // 同步到 iframe
-    const { iframeWindow: ifUndo, selectedElement: selUndo } = get();
-    if (ifUndo && selUndo && action.property) {
-      ifUndo.postMessage({ type: 'DECKFORGE_APPLY_STYLE', selector: selUndo.selector, property: action.property, value: action.oldValue || '' }, '*');
-    }
-  },
+    undo: () => travel('before'),
+    redo: () => travel('after'),
 
-  redo: () => {
-    const { undoStack, redoStack } = get();
-    if (redoStack.length === 0) return;
-    const action = redoStack[redoStack.length - 1];
-    set({
-      undoStack: [...undoStack, action],
-      redoStack: redoStack.slice(0, -1),
-    });
-    // 同步到 iframe
-    const { iframeWindow: ifRedo, selectedElement: selRedo } = get();
-    if (ifRedo && selRedo && action.property) {
-      ifRedo.postMessage({ type: 'DECKFORGE_APPLY_STYLE', selector: selRedo.selector, property: action.property, value: action.newValue || '' }, '*');
-    }
-  },
+    setZoom: (zoom) => {
+      set({ zoom });
+    },
 
-  setZoom: (zoom) => {
-    set({ zoom });
-  },
-
-  saveToFile: async () => {
-    const { fileTree, currentFile, addToast } = get();
-    if (!currentFile || fileTree.length === 0) {
-      addToast('没有可保存的文件', 'warning');
-      return;
-    }
-    try {
-      const htmlNode = fileTree.find((n) => n.path === currentFile);
-      if (!htmlNode || !htmlNode.content) {
-        addToast('找不到文件内容', 'error');
+    saveToFile: async () => {
+      const { currentFile, addToast } = get();
+      const fileTree = exportTree();
+      if (!currentFile || fileTree.length === 0) {
+        addToast('没有可保存的文件', 'warning');
         return;
       }
-      const content = typeof htmlNode.content === 'string'
-        ? htmlNode.content
-        : new TextDecoder().decode(htmlNode.content);
-      const blob = new Blob([content], { type: 'text/html' });
-      downloadBlob(blob, htmlNode.name);
-      addToast('文件已保存', 'success');
-    } catch (_err) {
-      addToast('保存失败', 'error');
-    }
-  },
+      try {
+        const htmlNode = fileTree.find((n) => n.path === currentFile);
+        if (!htmlNode || !htmlNode.content) {
+          addToast('找不到文件内容', 'error');
+          return;
+        }
+        const content = typeof htmlNode.content === 'string'
+          ? htmlNode.content
+          : new TextDecoder().decode(htmlNode.content);
+        const blob = new Blob([content], { type: 'text/html' });
+        downloadBlob(blob, htmlNode.name);
+        addToast('文件已保存', 'success');
+      } catch {
+        addToast('保存失败', 'error');
+      }
+    },
 
-  exportZip: async () => {
-    const { fileTree, addToast } = get();
-    if (fileTree.length === 0) {
-      addToast('没有可导出的文件', 'warning');
-      return;
-    }
-    try {
-      addToast('正在打包 ZIP...', 'info');
-      const blob = await createZip(fileTree);
-      downloadBlob(blob, 'deckforge-export.zip');
-      addToast('ZIP 导出成功', 'success');
-    } catch (_err) {
-      addToast('ZIP 导出失败', 'error');
-    }
-  },
-
-  exportSingleHtml: async () => {
-    const { fileTree, currentFile, addToast } = get();
-    if (!currentFile || fileTree.length === 0) {
-      addToast('没有可导出的文件', 'warning');
-      return;
-    }
-    try {
-      const htmlNode = fileTree.find((n) => n.path === currentFile);
-      if (!htmlNode || !htmlNode.content) {
-        addToast('找不到文件内容', 'error');
+    exportZip: async () => {
+      const { addToast } = get();
+      const fileTree = exportTree();
+      if (fileTree.length === 0) {
+        addToast('没有可导出的文件', 'warning');
         return;
       }
-      const content = typeof htmlNode.content === 'string'
-        ? htmlNode.content
-        : new TextDecoder().decode(htmlNode.content);
-      const inlined = inlineResources(content, fileTree);
-      const blob = new Blob([inlined], { type: 'text/html' });
-      downloadBlob(blob, 'deckforge-export.html');
-      addToast('单 HTML 导出成功', 'success');
-    } catch (_err) {
-      addToast('导出失败', 'error');
-    }
-  },
-
-  restoreOriginal: () => {
-    const { originalFileTree, setFileTree, setPages, addToast } = get();
-    const restored = JSON.parse(JSON.stringify(originalFileTree));
-    set({
-      fileTree: restored,
-      undoStack: [],
-      redoStack: [],
-      selectedElement: null,
-    });
-    setFileTree(restored);
-
-    const mainHtml = restored.find((n: FileNode) => n.isMainHtml || n.name.endsWith('.html'));
-    if (mainHtml && typeof mainHtml.content === 'string') {
-      const pages = parsePageStructure(mainHtml.content, mainHtml.path);
-      setPages(pages);
-    }
-    addToast('已恢复到初始状态', 'success');
-  },
-
-  addToast: (message, type) => {
-    const id = crypto.randomUUID();
-    const toast: ToastMessage = { id, message, type, duration: 3000 };
-    set((state) => ({ toasts: [...state.toasts, toast] }));
-    setTimeout(() => {
-      get().removeToast(id);
-    }, toast.duration);
-  },
-
-  removeToast: (id) => {
-    set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
-  },
-
-  toggleLeftPanel: () => {
-    set((state) => ({ leftPanelCollapsed: !state.leftPanelCollapsed }));
-  },
-
-  toggleRightPanel: () => {
-    set((state) => ({ rightPanelCollapsed: !state.rightPanelCollapsed }));
-  },
-
-  setAISettings: (settings) => {
-    set((state) => ({
-      aiSettings: { ...state.aiSettings, ...settings },
-    }));
-  },
-
-  setShowSettings: (show) => {
-    set({ showSettings: show });
-  },
-
-  setImportState: (state) => {
-    set((s) => ({ importState: { ...s.importState, ...state } }));
-  },
-
-  resetState: () => {
-    set({ ...initialState });
-  },
-
-  setFileTree: (tree) => {
-    set({ fileTree: tree });
-  },
-
-  setPages: (pages) => {
-    set({ pages });
-  },
-
-  setIframeWindow: (win) => {
-    set({ iframeWindow: win });
-  },
-
-  copyFormatPainter: () => {
-    const { selectedElement, addToast } = get();
-    if (!selectedElement) {
-      addToast('请先选中一个元素再复制格式', 'warning');
-      return;
-    }
-    set({
-      formatPainterSource: { ...selectedElement },
-      formatPainterActive: true,
-      formatPainterSticky: false,
-    });
-    addToast('格式已复制，点击目标元素应用', 'success');
-  },
-
-  toggleFormatPainter: () => {
-    const { formatPainterActive, formatPainterSource, selectedElement, copyFormatPainter, clearFormatPainter } = get();
-    if (!formatPainterActive) {
-      if (!formatPainterSource && selectedElement) {
-        copyFormatPainter();
-      } else if (formatPainterSource) {
-        set({ formatPainterActive: true });
+      try {
+        addToast('正在打包 ZIP...', 'info');
+        const blob = await createZip(fileTree);
+        downloadBlob(blob, 'deckforge-export.zip');
+        addToast('ZIP 导出成功', 'success');
+      } catch {
+        addToast('ZIP 导出失败', 'error');
       }
-    } else {
-      clearFormatPainter();
-    }
-  },
+    },
 
-  setFormatPainterSticky: (sticky) => {
-    set({ formatPainterSticky: sticky });
-  },
-
-  applyFormatPainter: (target) => {
-    const { formatPainterSource, iframeWindow, undoStack, addToast, clearFormatPainter, formatPainterSticky } = get();
-    if (!formatPainterSource) {
-      addToast('没有可复制应用的格式', 'warning');
-      return;
-    }
-    if (!target) {
-      addToast('请先选中目标元素', 'warning');
-      return;
-    }
-    if (formatPainterSource.selector === target.selector) {
-      addToast('不能将格式应用到源元素自身', 'warning');
-      return;
-    }
-
-    const stylesToApply: Record<string, string> = {};
-    const targetStyles = target.computedStyles;
-    const newActions: EditAction[] = [];
-
-    for (const property of FORMAT_PAINTER_PROPERTIES) {
-      const value = formatPainterSource.computedStyles[property];
-      if (value && value !== targetStyles[property]) {
-        stylesToApply[property] = value;
-        newActions.push({
-          id: crypto.randomUUID(),
-          type: 'style',
-          target: target.selector,
-          property,
-          oldValue: targetStyles[property] || null,
-          newValue: value,
-          timestamp: Date.now(),
-        });
+    exportSingleHtml: async () => {
+      const { currentFile, addToast } = get();
+      const fileTree = exportTree();
+      if (!currentFile || fileTree.length === 0) {
+        addToast('没有可导出的文件', 'warning');
+        return;
       }
-    }
+      try {
+        const htmlNode = fileTree.find((n) => n.path === currentFile);
+        if (!htmlNode || !htmlNode.content) {
+          addToast('找不到文件内容', 'error');
+          return;
+        }
+        const content = typeof htmlNode.content === 'string'
+          ? htmlNode.content
+          : new TextDecoder().decode(htmlNode.content);
+        const inlined = inlineResources(content, fileTree);
+        const blob = new Blob([inlined], { type: 'text/html' });
+        downloadBlob(blob, 'deckforge-export.html');
+        addToast('单 HTML 导出成功', 'success');
+      } catch {
+        addToast('导出失败', 'error');
+      }
+    },
 
-    if (Object.keys(stylesToApply).length === 0) {
-      addToast('目标元素已具有相同格式', 'info');
-      return;
-    }
+    restoreOriginal: () => {
+      const { fileTree, addToast } = get();
+      if (!fileTree.length) return;
+      openDeck(fileTree);
+      addToast('已恢复到初始状态', 'success');
+    },
 
-    set({ undoStack: [...undoStack, ...newActions], redoStack: [] });
+    addToast: (message, type) => {
+      const id = crypto.randomUUID();
+      const toast: ToastMessage = { id, message, type, duration: 3000 };
+      set((state) => ({ toasts: [...state.toasts, toast] }));
+      setTimeout(() => {
+        get().removeToast(id);
+      }, toast.duration);
+    },
 
-    // 更新本地选中元素的样式状态
-    set((state) => ({
-      selectedElement: state.selectedElement ? {
-        ...state.selectedElement,
-        computedStyles: { ...state.selectedElement.computedStyles, ...stylesToApply }
-      } : null
-    }));
+    removeToast: (id) => {
+      set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
+    },
 
-    // 同步到 iframe
-    if (iframeWindow) {
-      iframeWindow.postMessage({
-        type: 'DECKFORGE_APPLY_MULTIPLE_STYLES',
-        selector: target.selector,
-        styles: stylesToApply,
-      }, '*');
-    }
+    toggleLeftPanel: () => {
+      set((state) => ({ leftPanelCollapsed: !state.leftPanelCollapsed }));
+    },
 
-    addToast(`已应用 ${Object.keys(stylesToApply).length} 项格式`, 'success');
+    toggleRightPanel: () => {
+      set((state) => ({ rightPanelCollapsed: !state.rightPanelCollapsed }));
+    },
 
-    if (!formatPainterSticky) {
-      clearFormatPainter();
-    }
-  },
+    setAISettings: (settings) => {
+      set((state) => ({
+        aiSettings: { ...state.aiSettings, ...settings },
+      }));
+    },
 
-  clearFormatPainter: () => {
-    set({
-      formatPainterSource: null,
-      formatPainterActive: false,
-      formatPainterSticky: false,
-    });
-  },
-}));
+    setShowSettings: (show) => {
+      set({ showSettings: show });
+    },
+
+    setImportState: (state) => {
+      set((s) => ({ importState: { ...s.importState, ...state } }));
+    },
+
+    resetState: () => {
+      importVersion++;
+      set({ ...initialState, deck: null });
+    },
+
+    copyFormatPainter: () => {
+      const { selectedElement, addToast } = get();
+      if (!selectedElement) {
+        addToast('请先选中一个元素再复制格式', 'warning');
+        return;
+      }
+      set({
+        formatPainterSource: { ...selectedElement },
+        formatPainterActive: true,
+        formatPainterSticky: false,
+      });
+      addToast('格式已复制，点击目标元素应用', 'success');
+    },
+
+    toggleFormatPainter: () => {
+      const { formatPainterActive, formatPainterSource, selectedElement, copyFormatPainter, clearFormatPainter } = get();
+      if (!formatPainterActive) {
+        if (!formatPainterSource && selectedElement) {
+          copyFormatPainter();
+        } else if (formatPainterSource) {
+          set({ formatPainterActive: true });
+        }
+      } else {
+        clearFormatPainter();
+      }
+    },
+
+    setFormatPainterSticky: (sticky) => {
+      set({ formatPainterSticky: sticky });
+    },
+
+    applyFormatPainter: (target) => {
+      const { deck, formatPainterSource, addToast, clearFormatPainter, formatPainterSticky } = get();
+      if (!deck) return;
+      if (!formatPainterSource) {
+        addToast('没有可复制应用的格式', 'warning');
+        return;
+      }
+      if (!target) {
+        addToast('请先选中目标元素', 'warning');
+        return;
+      }
+      if (formatPainterSource.selector === target.selector) {
+        addToast('不能将格式应用到源元素自身', 'warning');
+        return;
+      }
+
+      const stylesToApply: Record<string, string> = {};
+      const targetStyles = target.computedStyles;
+
+      for (const property of FORMAT_PAINTER_PROPERTIES) {
+        const value = formatPainterSource.computedStyles[property];
+        if (value && value !== targetStyles[property]) {
+          stylesToApply[property] = value;
+        }
+      }
+
+      if (Object.keys(stylesToApply).length === 0) {
+        addToast('目标元素已具有相同格式', 'info');
+        return;
+      }
+
+      if (!commit(target.selector, deck.styleChanges(target.selector, stylesToApply))) return;
+      addToast(`已应用 ${Object.keys(stylesToApply).length} 项格式`, 'success');
+
+      if (!formatPainterSticky) {
+        clearFormatPainter();
+      }
+    },
+
+    clearFormatPainter: () => {
+      set({
+        formatPainterSource: null,
+        formatPainterActive: false,
+        formatPainterSticky: false,
+      });
+    },
+  };
+});
 
 /**
  * 解析 HTML 页面结构，识别 slides
  */
-function parsePageStructure(html: string, filePath: string): PageInfo[] {
-  const pages: PageInfo[] = [];
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-
-    for (const selector of SLIDE_SELECTORS) {
-      const elements = doc.querySelectorAll(selector);
-      if (elements.length > 0) {
-        elements.forEach((el, idx) => {
-          const title = extractTitle(el as HTMLElement) || `页面 ${idx + 1}`;
-          const type = detectPageType(el as HTMLElement);
-          pages.push({
-            id: crypto.randomUUID(),
-            index: idx,
-            title,
-            type,
-            selector: `${selector}:nth-child(${idx + 1})`,
-          });
-        });
-        break; // 使用第一个匹配到的选择器
-      }
-    }
-
-    // 如果没有识别到 slides，把整个 body 当作一个页面
-    if (pages.length === 0) {
-      const body = doc.body;
-      pages.push({
-        id: crypto.randomUUID(),
-        index: 0,
-        title: extractTitle(body) || filePath,
-        type: 'unknown',
-        selector: 'body',
-      });
-    }
-  } catch (err) {
-    console.error('Parse page structure failed:', err);
+function parsePageStructure(doc: Document, filePath: string): PageInfo[] {
+  for (const family of SLIDE_SELECTORS) {
+    const matches = Array.from(doc.body.querySelectorAll<HTMLElement>(family));
+    if (!matches.length) continue;
+    // reveal.js counts the leaves of a vertical slide stack. For plain HTML
+    // the outer section is the page; its nested sections are page content.
+    const elements = family === '.reveal .slides section'
+      ? matches.filter(el => !el.querySelector('section'))
+      : matches.filter(el => !el.parentElement?.closest(family));
+    return elements.map((el, index) => {
+      const selector = sourceSelector(el);
+      return { id: selector, index, selector, type: detectPageType(el),
+        title: extractTitle(el) || `页面 ${index + 1}` };
+    });
   }
-  return pages;
+  return [{ id: 'body', index: 0, selector: 'body', type: 'unknown', title: extractTitle(doc.body) || filePath }];
 }
 
 function extractTitle(el: HTMLElement): string | undefined {

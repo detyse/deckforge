@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState } from 'react';
 import { useStore } from '../../store';
-import { injectEditorBridge } from '../../utils/dom';
+import { bindPreview, injectEditorBridge } from '../../utils/dom';
 
 const DEFAULT_SLIDE_WIDTH = 1920;
 const DEFAULT_SLIDE_HEIGHT = 1080;
@@ -10,12 +10,12 @@ export function PreviewArea() {
   const containerRef = useRef<HTMLDivElement>(null);
   const blobUrlRef = useRef<string | null>(null);
   const loadedRef = useRef(false);
-  const { zoom, isEditMode, currentPageIndex, pages, hasImported, fileTree, currentFile, selectElement, formatPainterActive, formatPainterSource, applyFormatPainter, clearFormatPainter, setZoom } = useStore();
+  const { deck, zoom, isEditMode, selectedElement, currentPageIndex, pages, hasImported, fileTree, currentFile, setZoom } = useStore();
   const [iframeSize, setIframeSize] = useState({ width: DEFAULT_SLIDE_WIDTH, height: DEFAULT_SLIDE_HEIGHT });
 
   // 只在文件/内容变化时加载 iframe，不依赖页面索引和编辑模式
   useEffect(() => {
-    if (!iframeRef.current || !hasImported || !currentFile) return;
+    if (!iframeRef.current || !deck || !currentFile) return;
     const iframe = iframeRef.current;
     const htmlNode = fileTree.find((n) => n.path === currentFile);
     if (!htmlNode || !htmlNode.content) return;
@@ -24,23 +24,37 @@ export function PreviewArea() {
 
     const rawContent = typeof htmlNode.content === 'string' ? htmlNode.content : new TextDecoder().decode(htmlNode.content);
     const designSize = detectDesignSize(rawContent);
-    const prepared = prepareIframeContent(rawContent, fileTree, htmlNode.path, designSize);
+    const prepared = prepareIframeContent(deck.previewHtml(), fileTree, htmlNode.path, designSize);
 
     if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
     const blob = new Blob([prepared], { type: 'text/html' });
     const blobUrl = URL.createObjectURL(blob);
     blobUrlRef.current = blobUrl;
 
-    iframe.src = blobUrl;
-
+    let unbind: (() => void) | undefined;
     iframe.onload = () => {
-      injectEditorBridge(iframe);
+      const doc = iframe.contentDocument;
+      if (!doc || doc.URL !== blobUrl || useStore.getState().deck !== deck) return;
+      deck.preview = doc;
+      injectEditorBridge(iframe, deck);
+      unbind = bindPreview(doc, deck, {
+        editing: () => useStore.getState().isEditMode,
+        select: info => {
+          const state = useStore.getState();
+          state.selectElement(info);
+          if (info && state.formatPainterActive && state.formatPainterSource?.selector !== info.selector) {
+            state.applyFormatPainter(info);
+          }
+        },
+        commitText: (path, html) => {
+          if (useStore.getState().deck === deck) useStore.getState().commitText(path, html);
+        },
+        unavailable: () => useStore.getState().addToast('此元素无法对应到原始 HTML', 'warning'),
+        shortcut: handleShortcut,
+      });
       if (iframe.contentWindow) {
-        useStore.getState().setIframeWindow(iframe.contentWindow);
         loadedRef.current = true;
-        const state = useStore.getState();
-        iframe.contentWindow.postMessage({ type: 'DECKFORGE_SET_EDIT_MODE', enabled: state.isEditMode }, '*');
-        iframe.contentWindow.postMessage({ type: 'DECKFORGE_SHOW_PAGE', index: state.currentPageIndex }, '*');
+        showCurrentPage(iframe);
 
         // 尝试读取 iframe 内容尺寸并自适应缩放
         try {
@@ -64,75 +78,35 @@ export function PreviewArea() {
       }
     };
 
+    iframe.src = blobUrl;
+
     return () => {
+      unbind?.();
+      iframe.onload = null;
+      deck.preview = null;
       loadedRef.current = false;
       if (blobUrlRef.current) {
         URL.revokeObjectURL(blobUrlRef.current);
         blobUrlRef.current = null;
       }
     };
-  }, [hasImported, currentFile, fileTree, setZoom]);
+  }, [deck, currentFile, fileTree, setZoom]);
 
-  // 同步编辑模式到 iframe（仅当 iframe 已加载）
   useEffect(() => {
-    if (!loadedRef.current) return;
-    const iframe = iframeRef.current;
-    if (!iframe?.contentWindow) return;
-    iframe.contentWindow.postMessage({ type: 'DECKFORGE_SET_EDIT_MODE', enabled: isEditMode }, '*');
-  }, [isEditMode]);
-
-  // 同步页面切换到 iframe（仅当 iframe 已加载）
-  useEffect(() => {
-    if (!loadedRef.current) return;
-    const iframe = iframeRef.current;
-    if (!iframe?.contentWindow || pages.length === 0) return;
-    iframe.contentWindow.postMessage({ type: 'DECKFORGE_SHOW_PAGE', index: currentPageIndex }, '*');
+    if (loadedRef.current && iframeRef.current) showCurrentPage(iframeRef.current);
   }, [currentPageIndex, pages]);
 
   useEffect(() => {
-    const handleMessage = (e: MessageEvent) => {
-      if (!e.data || !e.data.type) return;
-      if (e.data.type === 'ELEMENT_SELECTED') {
-        const info = { tagName: e.data.tagName, selector: e.data.selector, textContent: e.data.textContent, isTextEditable: e.data.isTextEditable, isImage: e.data.isImage, computedStyles: e.data.computedStyles || {}, rect: e.data.rect || { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0, toJSON: () => '' } };
-        // 格式刷激活时：先应用格式，再更新选中元素
-        if (formatPainterActive && formatPainterSource && formatPainterSource.selector !== info.selector) {
-          selectElement(info);
-          applyFormatPainter(info);
-        } else {
-          selectElement(info);
-        }
-      }
-    };
-    window.addEventListener('message', handleMessage);
-    return () => { window.removeEventListener('message', handleMessage); useStore.getState().setIframeWindow(null); };
-  }, [selectElement, formatPainterActive, formatPainterSource, applyFormatPainter]);
+    const attr = deck?.marker + '-selected';
+    const el = selectedElement && deck?.previewElement(selectedElement.selector);
+    el?.setAttribute(attr, '');
+    return () => el?.removeAttribute(attr);
+  }, [deck, selectedElement]);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!hasImported) return;
-      const isMeta = e.ctrlKey || e.metaKey;
-      if (isMeta && e.key === 's') { e.preventDefault(); useStore.getState().saveToFile(); }
-      if (isMeta && e.key === 'z') {
-        e.preventDefault();
-        if (e.shiftKey) {
-          useStore.getState().redo();
-        } else {
-          useStore.getState().undo();
-        }
-      }
-      if (isMeta && e.key === 'e') {
-        e.preventDefault();
-        const state = useStore.getState();
-        state.setEditMode(!state.isEditMode);
-      }
-      if (e.key === 'Escape') {
-        if (formatPainterActive) { clearFormatPainter(); }
-        else { selectElement(null); }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [hasImported, selectElement, formatPainterActive, clearFormatPainter]);
+    window.addEventListener('keydown', handleShortcut);
+    return () => window.removeEventListener('keydown', handleShortcut);
+  }, []);
 
   if (!hasImported) return null;
 
@@ -155,6 +129,31 @@ export function PreviewArea() {
       </div>
     </div>
   );
+}
+
+function showCurrentPage(iframe: HTMLIFrameElement) {
+  const { pages, currentPageIndex } = useStore.getState();
+  iframe.contentWindow?.postMessage({
+    type: 'DECKFORGE_SHOW_PAGE', index: currentPageIndex, selectors: pages.map(p => p.selector),
+  }, '*');
+}
+
+function handleShortcut(e: KeyboardEvent) {
+  const state = useStore.getState();
+  const key = e.key.toLowerCase();
+  if (key === 'escape') {
+    if (state.formatPainterActive) state.clearFormatPainter();
+    else state.selectElement(null);
+  }
+  if (!(e.metaKey || e.ctrlKey)) return;
+  if (key === 's') { e.preventDefault(); state.saveToFile(); }
+  if (key === 'z') {
+    if ((e.target as Element)?.closest?.('input, textarea')) return;
+    e.preventDefault();
+    if (e.shiftKey) state.redo();
+    else state.undo();
+  }
+  if (key === 'e') { e.preventDefault(); state.setEditMode(!state.isEditMode); }
 }
 
 function prepareIframeContent(content: string, fileTree: { path: string; type: string; content?: string | ArrayBuffer; mimeType?: string }[], currentPath: string, designSize: { width: number; height: number }): string {

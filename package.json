@@ -29,6 +29,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test:e2e": "npm run build && node --test tests/deck-editing.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -49,6 +50,7 @@
     "@vitejs/plugin-react": "^6.0.2",
     "autoprefixer": "^10.5.2",
     "oxlint": "^1.69.0",
+    "playwright": "1.62.1",
     "postcss": "^8.5.15",
     "tailwindcss": "^4.3.1",
     "typescript": "~6.0.2",

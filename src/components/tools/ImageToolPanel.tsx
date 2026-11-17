@@ -41,8 +41,14 @@ export function ImageToolPanel() {
 
   const handleImageReplace = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
+    const { deck, selectedElement: target } = useStore.getState();
     const reader = new FileReader();
-    reader.onload = (ev) => { const url = ev.target?.result as string; if (url) replaceImage(url); };
+    reader.onload = () => {
+      const state = useStore.getState();
+      if (state.deck === deck && state.selectedElement?.selector === target?.selector && typeof reader.result === 'string') {
+        replaceImage(reader.result);
+      }
+    };
     reader.readAsDataURL(file);
   }, [replaceImage]);
 

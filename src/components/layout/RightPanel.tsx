@@ -116,7 +116,7 @@ export function RightPanel() {
             {activeTab === 'text' && <TextToolPanel />}
             {activeTab === 'image' && <ImageToolPanel />}
             {activeTab === 'layout' && <LayoutToolPanel />}
-            {activeTab === 'ai' && <AiToolPanel />}
+            {activeTab === 'ai' && <AiToolPanel key={selectedElement.selector} />}
           </div>
         </>
       )}

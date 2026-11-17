@@ -10,7 +10,11 @@ export function TopBar() {
 
   const handleImportClick = useCallback(() => { fileInputRef.current?.click(); }, []);
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files; if (files && files.length > 0) { useStore.getState().importFiles(files); }
+    const files = e.target.files;
+    if (files?.length) {
+      useStore.getState().importFiles(files);
+      e.target.value = '';
+    }
   }, []);
   const handleZoomIn = useCallback(() => { setZoom(Math.min(zoom + 25, 200)); }, [zoom, setZoom]);
   const handleZoomOut = useCallback(() => { setZoom(Math.max(zoom - 25, 25)); }, [zoom, setZoom]);
@@ -76,19 +80,19 @@ export function TopBar() {
                 <Paintbrush className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">{formatPainterActive ? '格式刷中' : '格式刷'}</span>
               </button>
-              <button onClick={() => { saveToFile(); addToast('保存成功', 'success'); }} className="deck-btn-ghost flex items-center gap-1.5" title="保存">
+              <button onClick={saveToFile} className="deck-btn-ghost flex items-center gap-1.5" title="保存">
                 <Save className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">保存</span>
               </button>
-              <button onClick={() => { exportZip(); addToast('ZIP 导出成功', 'success'); }} className="deck-btn-ghost flex items-center gap-1.5" title="导出 ZIP">
+              <button onClick={exportZip} className="deck-btn-ghost flex items-center gap-1.5" title="导出 ZIP">
                 <FileArchive className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">ZIP</span>
               </button>
-              <button onClick={() => { exportSingleHtml(); addToast('单 HTML 导出成功', 'success'); }} className="deck-btn-ghost flex items-center gap-1.5" title="导出单 HTML">
+              <button onClick={exportSingleHtml} className="deck-btn-ghost flex items-center gap-1.5" title="导出单 HTML">
                 <FileCode className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">单 HTML</span>
               </button>
-              <IconButton icon={RotateCcw} title="恢复原始" onClick={() => { restoreOriginal(); addToast('已恢复', 'warning'); }} />
+              <IconButton icon={RotateCcw} title="恢复原始" onClick={restoreOriginal} />
               <div className="deck-divider-v" />
               <IconButton icon={Undo2} title="撤销" onClick={undo} disabled={undoStack.length === 0} />
               <IconButton icon={Redo2} title="重做" onClick={redo} disabled={redoStack.length === 0} />

@@ -2,49 +2,14 @@
  * DOM 操作工具函数
  */
 
-/**
- * 为元素生成唯一 CSS 选择器
- */
-export function generateSelector(el: HTMLElement, root: HTMLElement = document.body): string {
-  if (!el || el === root) return '';
-
-  if (el.id) return `#${el.id}`;
-
-  const tag = el.tagName.toLowerCase();
-  const classes = Array.from(el.classList)
-    .filter((c) => !c.startsWith('deckforge-'))
-    .join('.');
-
-  const parent = el.parentElement;
-  if (!parent || parent === root) {
-    return classes ? `${tag}.${classes}` : tag;
-  }
-
-  const siblings = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
-  const index = siblings.indexOf(el) + 1;
-  const selector = classes
-    ? `${tag}.${classes}:nth-of-type(${index})`
-    : `${tag}:nth-of-type(${index})`;
-
-  return selector;
-}
-
-/**
- * 从选择器查找元素
- */
-export function findElementBySelector(selector: string, doc: Document = document): HTMLElement | null {
-  try {
-    return doc.querySelector(selector) as HTMLElement;
-  } catch {
-    return null;
-  }
-}
+import type { SelectedElementInfo } from '../types';
+import type { DeckDocument } from './deckDocument';
 
 /**
  * 获取元素的计算样式映射
  */
 export function getComputedStyleMap(el: HTMLElement): Record<string, string> {
-  const computed = window.getComputedStyle(el);
+  const computed = el.ownerDocument.defaultView!.getComputedStyle(el);
   return {
     fontFamily: computed.fontFamily,
     fontSize: computed.fontSize,
@@ -88,7 +53,7 @@ export function isImageElement(el: HTMLElement): boolean {
 /**
  * 为 iframe 注入编辑桥接脚本
  */
-export function injectEditorBridge(iframe: HTMLIFrameElement): void {
+export function injectEditorBridge(iframe: HTMLIFrameElement, deck: DeckDocument): void {
   if (!iframe.contentWindow || !iframe.contentDocument) return;
 
   const script = iframe.contentDocument.createElement('script');
@@ -97,18 +62,9 @@ export function injectEditorBridge(iframe: HTMLIFrameElement): void {
       if (window.__deckforgeBridgeLoaded) return;
       window.__deckforgeBridgeLoaded = true;
 
-      let selectedElement = null;
-      let isEditMode = false;
+      const marker = ${JSON.stringify(deck.marker)};
       let allSlides = [];
-      let currentSlideIndex = 0;
-      let originalDisplayStyles = new Map();
-
-      // 通用 Slide 选择器（在未检测到知名库时使用）
-      const GENERIC_SELECTORS = [
-        '.slide', '.page', '.chapter',
-        '[data-slide]', '[data-page]', '[data-section]',
-        '.swiper-slide', '.carousel-item',
-      ];
+      const originalDisplayStyles = new WeakMap();
 
       function getOriginalDisplay(el) {
         if (!originalDisplayStyles.has(el)) {
@@ -182,14 +138,6 @@ export function injectEditorBridge(iframe: HTMLIFrameElement): void {
         return null;
       }
 
-      function clearHighlight() {
-        if (selectedElement) {
-          selectedElement.style.outline = '';
-          selectedElement.style.outlineOffset = '';
-          selectedElement = null;
-        }
-      }
-
       function detectPresentationLibrary() {
         if (typeof window.Reveal !== 'undefined' && window.Reveal) return 'reveal';
         if (typeof window.impress !== 'undefined' && window.impress) return 'impress';
@@ -199,101 +147,21 @@ export function injectEditorBridge(iframe: HTMLIFrameElement): void {
         return 'native';
       }
 
-      function findAllSlides() {
-        allSlides = [];
-
-        // 1. reveal.js（已初始化 API）
-        if (typeof window.Reveal !== 'undefined' && window.Reveal && window.Reveal.getSlides) {
-          try {
-            const slides = window.Reveal.getSlides();
-            if (slides && slides.length > 1) {
-              allSlides = Array.from(slides);
-              allSlides.forEach(getOriginalDisplay);
-              return true;
-            }
-          } catch (e) {}
-        }
-
-        // 2. reveal.js（未初始化 API，仅 DOM 结构）
-        try {
-          const revealSlides = document.querySelectorAll('.reveal .slides > section');
-          if (revealSlides.length > 1) {
-            allSlides = Array.from(revealSlides);
-            allSlides.forEach(getOriginalDisplay);
-            return true;
-          }
-        } catch (e) {}
-
-        // 3. impress.js
-        if (typeof window.impress !== 'undefined' && window.impress) {
-          try {
-            const steps = document.querySelectorAll('.step');
-            if (steps.length > 1) {
-              allSlides = Array.from(steps);
-              allSlides.forEach(getOriginalDisplay);
-              return true;
-            }
-          } catch (e) {}
-        }
-
-        // 4. fullpage.js
-        if (typeof window.fullpage_api !== 'undefined' && window.fullpage_api) {
-          try {
-            const sections = document.querySelectorAll('.section');
-            if (sections.length > 1) {
-              allSlides = Array.from(sections);
-              allSlides.forEach(getOriginalDisplay);
-              return true;
-            }
-          } catch (e) {}
-        }
-
-        // 5. swiper
-        if (typeof window.Swiper !== 'undefined' && window.Swiper) {
-          try {
-            const swiperSlides = document.querySelectorAll('.swiper-slide');
-            if (swiperSlides.length > 1) {
-              allSlides = Array.from(swiperSlides);
-              allSlides.forEach(getOriginalDisplay);
-              return true;
-            }
-          } catch (e) {}
-        }
-
-        // 6. 通用选择器
-        for (const sel of GENERIC_SELECTORS) {
-          try {
-            const els = document.querySelectorAll(sel);
-            if (els.length > 1) {
-              allSlides = Array.from(els);
-              allSlides.forEach(getOriginalDisplay);
-              return true;
-            }
-          } catch (e) {}
-        }
-
-        // 兜底：把整个 body 当作一页
-        allSlides = [document.body];
-        return true;
-      }
-
-      function showSlide(index) {
-        if (allSlides.length === 0) findAllSlides();
-        if (allSlides.length <= 1) return;
-
-        index = Math.max(0, Math.min(index, allSlides.length - 1));
-        currentSlideIndex = index;
-
-        // 切换页面时清除当前选中高亮，避免残留 outline 留在不可见页
-        clearHighlight();
-
+      function showSlide(index, selectors) {
+        allSlides = selectors.map(path => {
+          const matches = document.querySelectorAll('[' + marker + '="' + CSS.escape(path) + '"]');
+          return matches.length === 1 ? matches[0] : null;
+        });
+        if (allSlides.length <= 1 || allSlides.some(el => !el) || !allSlides[index]) return;
+        allSlides.forEach(getOriginalDisplay);
         const target = allSlides[index];
         const lib = detectPresentationLibrary();
 
         // 优先使用知名 PPT/幻灯片库的 API，避免直接覆盖 display 破坏动画/过渡
         if (lib === 'reveal' && typeof window.Reveal.slide === 'function') {
           try {
-            window.Reveal.slide(target);
+            const { h, v } = window.Reveal.getIndices(target);
+            window.Reveal.slide(h, v);
             return;
           } catch (e) {}
         }
@@ -376,218 +244,94 @@ export function injectEditorBridge(iframe: HTMLIFrameElement): void {
         return null;
       }
 
-      function generateSelector(el) {
-        if (!el) return '';
-        if (el.id) return '#' + el.id;
-        const tag = el.tagName.toLowerCase();
-        const classes = Array.from(el.classList).filter(c => !c.startsWith('deckforge-')).join('.');
-        const parent = el.parentElement;
-        if (!parent) return classes ? tag + '.' + classes : tag;
-        const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
-        const index = siblings.indexOf(el) + 1;
-        return classes ? tag + '.' + classes + ':nth-of-type(' + index + ')' : tag + ':nth-of-type(' + index + ')';
-      }
-
-      function getComputedStyleMap(el) {
-        const cs = window.getComputedStyle(el);
-        return {
-          fontFamily: cs.fontFamily,
-          fontSize: cs.fontSize,
-          fontWeight: cs.fontWeight,
-          lineHeight: cs.lineHeight,
-          letterSpacing: cs.letterSpacing,
-          color: cs.color,
-          textAlign: cs.textAlign,
-          backgroundColor: cs.backgroundColor,
-          borderRadius: cs.borderRadius,
-          width: cs.width,
-          height: cs.height,
-          display: cs.display,
-          position: cs.position,
-          zIndex: cs.zIndex,
-          padding: cs.padding,
-          margin: cs.margin,
-          opacity: cs.opacity,
-          boxShadow: cs.boxShadow,
-          textDecoration: cs.textDecoration,
-          fontStyle: cs.fontStyle,
-        };
-      }
-
-      function isTextEditable(el) {
-        const tag = el.tagName.toLowerCase();
-        const editableTags = ['p','h1','h2','h3','h4','h5','h6','span','div','a','li','td','th','label','strong','em','b','i','small'];
-        return editableTags.includes(tag) && !el.querySelector('img, svg, canvas, video, iframe');
-      }
-
-      function isImage(el) {
-        return el.tagName.toLowerCase() === 'img' || el.tagName.toLowerCase() === 'svg';
-      }
-
-      function highlightElement(el) {
-        if (selectedElement) {
-          selectedElement.style.outline = '';
-          selectedElement.style.outlineOffset = '';
-        }
-        selectedElement = el;
-        if (el) {
-          el.style.outline = '2px solid #7c3aed';
-          el.style.outlineOffset = '2px';
-          // 滚动到视图中
-          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        }
-      }
-
-      function enterTextEdit(el) {
-        if (!el || el.isContentEditable) return;
-        // 强制允许文本选择，避免父元素 user-select: none 导致无法编辑
-        el.contentEditable = 'true';
-        el.style.userSelect = 'text';
-        el.style.webkitUserSelect = 'text';
-        el.style.pointerEvents = 'auto';
-        try {
-          el.focus();
-        } catch(e) {}
-        // 将光标移到元素末尾
-        try {
-          const range = document.createRange();
-          const sel = window.getSelection();
-          range.selectNodeContents(el);
-          range.collapse(false);
-          sel.removeAllRanges();
-          sel.addRange(range);
-        } catch(e) {}
-        const onBlur = function() {
-          el.contentEditable = 'false';
-          el.style.userSelect = '';
-          el.style.webkitUserSelect = '';
-          el.style.pointerEvents = '';
-          el.removeEventListener('blur', onBlur);
-          window.parent.postMessage({
-            type: 'ELEMENT_TEXT_CHANGED',
-            selector: generateSelector(el),
-            text: el.textContent,
-          }, '*');
-        };
-        el.addEventListener('blur', onBlur);
-      }
-
-      document.addEventListener('click', function(e) {
-        if (!isEditMode) return;
-        const el = e.target;
-        if (!el || el === document.body || el === document.documentElement) return;
-
-        // 如果点击在已有 contenteditable 元素内，不阻止默认行为，让浏览器处理光标和选择
-        const editableRoot = el.closest ? el.closest('[contenteditable="true"]') : null;
-        if (editableRoot) {
-          highlightElement(editableRoot);
-          return;
-        }
-
-        // 普通元素：仅选中
-        e.preventDefault();
-        e.stopPropagation();
-        highlightElement(el);
-        window.parent.postMessage({
-          type: 'ELEMENT_SELECTED',
-          selector: generateSelector(el),
-          tagName: el.tagName,
-          textContent: el.textContent?.substring(0, 100),
-          isTextEditable: isTextEditable(el),
-          isImage: isImage(el),
-          computedStyles: getComputedStyleMap(el),
-          rect: el.getBoundingClientRect(),
-        }, '*');
-      }, true);
-
-      document.addEventListener('dblclick', function(e) {
-        if (!isEditMode) return;
-        const el = e.target;
-        if (!el || !isTextEditable(el)) return;
-        if (el.isContentEditable) return;
-        e.preventDefault();
-        e.stopPropagation();
-        enterTextEdit(el);
-        highlightElement(el);
-        window.parent.postMessage({
-          type: 'ELEMENT_SELECTED',
-          selector: generateSelector(el),
-          tagName: el.tagName,
-          textContent: el.textContent?.substring(0, 100),
-          isTextEditable: true,
-          isImage: isImage(el),
-          computedStyles: getComputedStyleMap(el),
-          rect: el.getBoundingClientRect(),
-        }, '*');
-      }, true);
-
-      // 阻止链接跳转
-      document.addEventListener('click', function(e) {
-        if (!isEditMode) return;
-        const el = e.target.closest('a');
-        if (el) {
-          e.preventDefault();
-        }
-      }, true);
-
       window.addEventListener('message', function(e) {
-        if (!e.data || !e.data.type) return;
-        if (e.data.type === 'DECKFORGE_SET_EDIT_MODE') {
-          isEditMode = e.data.enabled;
-          if (!isEditMode && selectedElement) {
-            selectedElement.style.outline = '';
-            selectedElement.style.outlineOffset = '';
-            selectedElement = null;
-          }
-        }
-        if (e.data.type === 'DECKFORGE_SHOW_PAGE') {
-          showSlide(e.data.index);
-        }
-        if (e.data.type === 'DECKFORGE_APPLY_STYLE') {
-          const target = document.querySelector(e.data.selector);
-          if (target) target.style[e.data.property] = e.data.value;
-        }
-        if (e.data.type === 'DECKFORGE_APPLY_MULTIPLE_STYLES') {
-          const target = document.querySelector(e.data.selector);
-          if (target && e.data.styles) {
-            for (const key in e.data.styles) {
-              if (Object.prototype.hasOwnProperty.call(e.data.styles, key)) {
-                target.style[key] = e.data.styles[key];
-              }
-            }
-          }
-        }
-        if (e.data.type === 'DECKFORGE_APPLY_TEXT') {
-          const target = document.querySelector(e.data.selector);
-          if (target) target.textContent = e.data.text;
-        }
-        if (e.data.type === 'DECKFORGE_REPLACE_IMAGE') {
-          const target = document.querySelector(e.data.selector);
-          if (target && target.tagName.toLowerCase() === 'img') {
-            target.src = e.data.imageData;
-          }
-        }
-        if (e.data.type === 'DECKFORGE_REPLACE_HTML') {
-          const target = document.querySelector(e.data.selector);
-          if (target) {
-            try {
-              const wrapper = document.createElement('div');
-              wrapper.innerHTML = e.data.html;
-              const newEl = wrapper.firstElementChild || wrapper;
-              target.replaceWith(newEl);
-            } catch (err) {
-              console.error('Replace HTML failed:', err);
-            }
-          }
+        if (e.source === window.parent && e.data?.type === 'DECKFORGE_SHOW_PAGE') {
+          showSlide(e.data.index, e.data.selectors);
         }
       });
-
-      // 初始化：查找所有 slides，默认显示第一个
-      findAllSlides();
-      showSlide(0);
     })();
   `;
   iframe.contentDocument.head.appendChild(script);
+}
+
+export function describeElement(el: HTMLElement, selector: string): SelectedElementInfo {
+  return {
+    selector, tagName: el.tagName, textContent: el.textContent || '',
+    isTextEditable: isTextEditable(el), isImage: isImageElement(el),
+    computedStyles: getComputedStyleMap(el), rect: el.getBoundingClientRect(),
+  };
+}
+
+interface PreviewEvents {
+  editing: () => boolean;
+  select: (element: SelectedElementInfo | null) => void;
+  commitText: (selector: string, html: string) => void;
+  unavailable: () => void;
+  shortcut: (event: KeyboardEvent) => void;
+}
+
+export function bindPreview(doc: Document, deck: DeckDocument, events: PreviewEvents) {
+  const selected = deck.marker + '-selected';
+  const editing = deck.marker + '-editing';
+  const style = doc.createElement('style');
+  style.textContent = `[${selected}]{outline:2px solid #7c3aed!important;outline-offset:2px}
+    [${editing}]{user-select:text!important;pointer-events:auto!important}`;
+  doc.head.appendChild(style);
+
+  function targetOf(e: MouseEvent) {
+    if (!events.editing()) return null;
+    const el = e.target as HTMLElement;
+    if (!el.tagName || el === doc.body || el === doc.documentElement || el.closest('[' + editing + ']')) return null;
+    e.preventDefault();
+    e.stopPropagation();
+    const path = el.getAttribute(deck.marker);
+    if (!path || deck.previewElement(path) !== el) {
+      events.select(null);
+      events.unavailable();
+      return null;
+    }
+    return { el, path };
+  }
+
+  function click(e: MouseEvent) {
+    const target = targetOf(e);
+    if (target) events.select(describeElement(target.el, target.path));
+  }
+
+  function doubleClick(e: MouseEvent) {
+    const target = targetOf(e);
+    if (!target || !isTextEditable(target.el)) return;
+    const { el, path } = target;
+    // Flush a previous editor before reading the new baseline.
+    (doc.activeElement as HTMLElement | null)?.blur();
+    const before = el.innerHTML;
+    const previousEditable = el.getAttribute('contenteditable');
+    el.setAttribute(editing, '');
+    el.contentEditable = 'true';
+    el.addEventListener('blur', () => {
+      if (previousEditable === null) el.removeAttribute('contenteditable');
+      else el.setAttribute('contenteditable', previousEditable);
+      el.removeAttribute(editing);
+      if (el.innerHTML !== before) events.commitText(path, deck.editedContent(el));
+    }, { once: true });
+    el.focus();
+    const range = doc.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const selection = doc.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    events.select(describeElement(el, path));
+  }
+
+  doc.addEventListener('click', click, true);
+  doc.addEventListener('dblclick', doubleClick, true);
+  doc.addEventListener('keydown', events.shortcut, true);
+  return () => {
+    doc.removeEventListener('click', click, true);
+    doc.removeEventListener('dblclick', doubleClick, true);
+    doc.removeEventListener('keydown', events.shortcut, true);
+  };
 }
 
 /**

@@ -24,14 +24,14 @@ export interface PageInfo {
 }
 
 /** 编辑动作（用于撤销重做） */
+export type EditChange =
+  | { type: 'style'; property: string; priority: string; before: string; after: string }
+  | { type: 'attribute'; name: string; before: string | null; after: string | null }
+  | { type: 'content' | 'element'; before: string; after: string };
+
 export interface EditAction {
-  id: string;
-  type: 'style' | 'text' | 'replace' | 'delete' | 'add';
-  target: string; // CSS selector
-  property?: string;
-  oldValue: string | null;
-  newValue: string | null;
-  timestamp: number;
+  target: string;
+  changes: EditChange[];
 }
 
 /** 选中元素信息 */
@@ -105,7 +105,6 @@ export interface EditorState {
 export interface AppState {
   // 文件系统
   fileTree: FileNode[];
-  originalFileTree: FileNode[];
   currentFile: string | null;
   
   // 页面
@@ -134,9 +133,6 @@ export interface AppState {
   // 是否已导入文件
   hasImported: boolean;
   
-  // iframe 引用
-  iframeWindow: Window | null;
-
   // 格式刷
   formatPainterSource: SelectedElementInfo | null;
   formatPainterActive: boolean;

@@ -111,7 +111,7 @@ export const AI_ADAPTER_TEMPLATES = [
 export const SLIDE_SELECTORS = [
   '.slide', '.page', '.section', '.chapter',
   '[data-slide]', '[data-page]', '[data-section]',
-  '.reveal .slides section', '.impress-step',
+  '.reveal .slides section', '#impress .step', '.impress-step',
   '.swiper-slide', '.carousel-item',
   'section', 'article',
 ];
